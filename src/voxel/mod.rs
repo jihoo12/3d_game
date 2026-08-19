@@ -2,6 +2,7 @@ mod block;
 mod grid;
 mod interaction;
 pub mod mesh;
+mod noise;
 mod terrain;
 
 use bevy::prelude::*;

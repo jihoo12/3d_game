@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use super::block::Block;
 use super::grid::VoxelGrid;
-use super::terrain::build_voxel_grid;
+use super::terrain::{build_voxel_grid, SEA_LEVEL};
 use super::VoxelWorld;
 
 #[derive(Default)]
@@ -169,9 +169,43 @@ pub fn spawn_voxel_terrain(
         collider_entity: None,
     };
 
+    spawn_water_plane(commands, meshes, materials, &voxel_world.grid);
     rebuild_voxel_meshes(commands, meshes, materials, &mut voxel_world);
 
     commands.insert_resource(voxel_world);
+}
+
+/// A single flat, semi-transparent quad at sea level — not part of the voxel
+/// grid, just one big plane — so low terrain reads as lakes/coastline
+/// without needing a full voxel water simulation. Purely cosmetic: no flow,
+/// no buoyancy, no collider, so the player currently walks/falls straight
+/// through it like fog.
+fn spawn_water_plane(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    grid: &VoxelGrid,
+) {
+    let width = grid.dims[0] as f32;
+    let depth = grid.dims[2] as f32;
+    let mesh = meshes.add(Plane3d::default().mesh().size(width, depth));
+    let material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.2, 0.45, 0.75, 0.55),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 0.05,
+        ..default()
+    });
+
+    let origin_offset = grid.origin_offset();
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(material),
+        Transform::from_translation(Vec3::new(
+            origin_offset.x + width / 2.0,
+            SEA_LEVEL as f32,
+            origin_offset.z + depth / 2.0,
+        )),
+    ));
 }
 
 /// Rebuilds EVERY mesh entity and the ENTIRE physics collider from the full

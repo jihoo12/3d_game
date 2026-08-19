@@ -6,7 +6,7 @@
 //!   Space         jump
 //!   Left click    place the selected block
 //!   Right click   mine the targeted block
-//!   1 / 2 / 3     select Grass / Dirt / Stone to place
+//!   1-7           select Grass / Dirt / Stone / Sand / Snow / Wood / Leaves
 //!   Esc           release the cursor; click the window to re-grab it
 //!
 //! Module layout:

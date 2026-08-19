@@ -4,7 +4,9 @@ use super::block::Block;
 
 /// World spans -CHUNK_RADIUS..CHUNK_RADIUS on x/z.
 pub const CHUNK_RADIUS: i32 = 20;
-pub const MAX_HEIGHT: i32 = 6;
+// Was 6 — bumped so hills (surface height now goes up to ~14) and trees on
+// top of them still fit inside the grid instead of getting clipped flat.
+pub const MAX_HEIGHT: i32 = 24;
 
 /// A dense 3D array of blocks. Coordinates passed to `get`/`set` are
 /// grid-local (0..dims), not world space — use `origin_offset()` to convert

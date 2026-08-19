@@ -18,12 +18,26 @@ impl Default for SelectedBlock {
 }
 
 pub fn cycle_selected_block(keyboard: Res<ButtonInput<KeyCode>>, mut selected: ResMut<SelectedBlock>) {
-    if keyboard.just_pressed(KeyCode::Digit1) {
-        selected.0 = Block::Grass;
+    let picked = if keyboard.just_pressed(KeyCode::Digit1) {
+        Some(Block::Grass)
     } else if keyboard.just_pressed(KeyCode::Digit2) {
-        selected.0 = Block::Dirt;
+        Some(Block::Dirt)
     } else if keyboard.just_pressed(KeyCode::Digit3) {
-        selected.0 = Block::Stone;
+        Some(Block::Stone)
+    } else if keyboard.just_pressed(KeyCode::Digit4) {
+        Some(Block::Sand)
+    } else if keyboard.just_pressed(KeyCode::Digit5) {
+        Some(Block::Snow)
+    } else if keyboard.just_pressed(KeyCode::Digit6) {
+        Some(Block::Wood)
+    } else if keyboard.just_pressed(KeyCode::Digit7) {
+        Some(Block::Leaves)
+    } else {
+        None
+    };
+
+    if let Some(block) = picked {
+        selected.0 = block;
     }
 }
 

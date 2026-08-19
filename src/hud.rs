@@ -42,7 +42,7 @@ fn setup_hud(mut commands: Commands) {
     // Selected block / controls hint, bottom-left
     commands.spawn((
         Text::new(format!(
-            "Block: {}  (1/2/3 select, LMB place, RMB mine)",
+            "Block: {}  (1-7 select, LMB place, RMB mine)",
             SelectedBlock::default().0.name()
         )),
         TextFont {
@@ -91,7 +91,7 @@ fn update_selected_block_label(
         return;
     };
     **text = format!(
-        "Block: {}  (1/2/3 select, LMB place, RMB mine)",
+        "Block: {}  (1-7 select, LMB place, RMB mine)",
         selected.0.name()
     );
 }
