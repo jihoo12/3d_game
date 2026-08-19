@@ -7,6 +7,7 @@ use bevy::{
         mesh::{Indices, PrimitiveTopology},
         render_resource::{TextureViewDescriptor, TextureViewDimension},
     },
+    window::{CursorGrabMode, CursorOptions},
 };
 use bevy_rapier3d::prelude::*;
 use std::collections::HashMap;
@@ -20,6 +21,15 @@ fn main() {
                 resolution: (800, 600).into(),
                 ..default()
             }),
+            // Grab + hide the cursor from the start, like Minecraft. This is
+            // set here (rather than mutated in a Startup system) because
+            // toggling CursorGrabMode on frame 0 is unreliable on X11 —
+            // setting it as part of window creation avoids that.
+            primary_cursor_options: Some(CursorOptions {
+                grab_mode: CursorGrabMode::Locked,
+                visible: false,
+                ..default()
+            }),
             ..default()
         }))
         .add_plugins((
@@ -27,7 +37,17 @@ fn main() {
             RapierDebugRenderPlugin::default(),
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, (move_player, camera_orbit, check_skybox_loaded))
+        .add_systems(
+            Update,
+            (
+                move_player,
+                camera_orbit,
+                check_skybox_loaded,
+                mine_block,
+                highlight_targeted_block,
+                grab_mouse_cursor,
+            ),
+        )
         .run();
 }
 
@@ -103,6 +123,16 @@ impl VoxelGrid {
         let idx = self.index(x, y, z);
         self.blocks[idx] = block;
     }
+}
+
+// Holds the CPU-side voxel grid plus every entity currently representing it
+// on screen (one mesh entity per block type, plus the physics collider), so
+// a mining action can despawn all of them and rebuild from scratch.
+#[derive(Resource)]
+struct VoxelWorld {
+    grid: VoxelGrid,
+    mesh_entities: Vec<Entity>,
+    collider_entity: Option<Entity>,
 }
 
 // Cheap "blocky noise" heightmap — swap for the `noise` crate's Perlin/Simplex
@@ -290,9 +320,40 @@ fn spawn_voxel_terrain(
     meshes: &mut ResMut<Assets<Mesh>>,
     materials: &mut ResMut<Assets<StandardMaterial>>,
 ) {
-    let grid = build_voxel_grid();
-    let chunk_meshes = greedy_mesh(&grid);
+    let mut voxel_world = VoxelWorld {
+        grid: build_voxel_grid(),
+        mesh_entities: Vec::new(),
+        collider_entity: None,
+    };
+
+    rebuild_voxel_meshes(commands, meshes, materials, &mut voxel_world);
+
+    commands.insert_resource(voxel_world);
+}
+
+// Rebuilds EVERY mesh entity and the ENTIRE physics collider from the full
+// voxel grid, from scratch, every time it's called. There's no dirty-chunk
+// tracking and no partial update path on purpose: this is called once at
+// startup, and then again on every single block mined, so it re-runs greedy
+// meshing over the whole world and re-uploads brand new GPU mesh buffers
+// each time. That's what makes mining feel laggy as the world gets bigger —
+// a real implementation would only touch the affected chunk.
+fn rebuild_voxel_meshes(
+    commands: &mut Commands,
+    meshes: &mut ResMut<Assets<Mesh>>,
+    materials: &mut ResMut<Assets<StandardMaterial>>,
+    voxel_world: &mut VoxelWorld,
+) {
+    // Despawn everything from the previous rebuild first.
+    for entity in voxel_world.mesh_entities.drain(..) {
+        commands.entity(entity).despawn();
+    }
+    if let Some(collider_entity) = voxel_world.collider_entity.take() {
+        commands.entity(collider_entity).despawn();
+    }
+
     let origin_offset = Vec3::new(-CHUNK_RADIUS as f32, 0.0, -CHUNK_RADIUS as f32);
+    let chunk_meshes = greedy_mesh(&voxel_world.grid);
 
     // One draw call per material instead of one per block.
     for (block, mesh_data) in chunk_meshes {
@@ -305,14 +366,17 @@ fn spawn_voxel_terrain(
         mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, mesh_data.uvs);
         mesh.insert_indices(Indices::U32(mesh_data.indices));
 
-        commands.spawn((
-            Mesh3d(meshes.add(mesh)),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: block.color(),
-                ..default()
-            })),
-            Transform::from_translation(origin_offset),
-        ));
+        let entity = commands
+            .spawn((
+                Mesh3d(meshes.add(mesh)),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: block.color(),
+                    ..default()
+                })),
+                Transform::from_translation(origin_offset),
+            ))
+            .id();
+        voxel_world.mesh_entities.push(entity);
     }
 
     // Physics: ONE voxels collider for the whole terrain instead of one box
@@ -323,21 +387,136 @@ fn spawn_voxel_terrain(
     // problem). It also uses the SAME integer grid coordinates as the mesh,
     // so with the matching origin_offset transform it lines up automatically.
     let mut solid_coords: Vec<IVect> = Vec::new();
-    for x in 0..grid.dims[0] {
-        for y in 0..grid.dims[1] {
-            for z in 0..grid.dims[2] {
-                if grid.get(x, y, z).is_solid() {
+    for x in 0..voxel_world.grid.dims[0] {
+        for y in 0..voxel_world.grid.dims[1] {
+            for z in 0..voxel_world.grid.dims[2] {
+                if voxel_world.grid.get(x, y, z).is_solid() {
                     solid_coords.push(IVect::new(x, y, z));
                 }
             }
         }
     }
 
-    commands.spawn((
-        RigidBody::Fixed,
-        Collider::voxels(Vec3::splat(1.0), &solid_coords),
-        Transform::from_translation(origin_offset),
-    ));
+    let collider_entity = commands
+        .spawn((
+            RigidBody::Fixed,
+            Collider::voxels(Vec3::splat(1.0), &solid_coords),
+            Transform::from_translation(origin_offset),
+        ))
+        .id();
+    voxel_world.collider_entity = Some(collider_entity);
+}
+
+// Simple fixed-step ray march through the voxel grid (no DDA/amanatides-woo
+// acceleration) to find the first solid block along a ray. `origin` must
+// already be in grid-local space (i.e. with origin_offset subtracted out).
+fn raycast_voxel(grid: &VoxelGrid, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<(i32, i32, i32)> {
+    let dir = dir.normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return None;
+    }
+
+    let step = 0.05;
+    let steps = (max_dist / step) as i32;
+    let mut last_cell: Option<(i32, i32, i32)> = None;
+
+    for i in 0..steps {
+        let p = origin + dir * (i as f32 * step);
+        let cell = (p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+        if Some(cell) == last_cell {
+            continue;
+        }
+        last_cell = Some(cell);
+
+        if grid.get(cell.0, cell.1, cell.2).is_solid() {
+            return Some(cell);
+        }
+    }
+
+    None
+}
+
+// Mining: right-click removes the first solid block the camera is looking
+// at, then rebuilds the ENTIRE world mesh + collider from scratch (see
+// rebuild_voxel_meshes). Every mine is therefore an O(whole grid) operation
+// instead of an O(one chunk) one, as requested.
+// Shared aim logic: the camera always looks_at the player (see
+// camera_orbit), so camera_transform.forward() points AT the player — the
+// ray needs to start at the player and continue outward from there (not
+// start at the camera) or it burns its whole range just reaching them.
+fn find_targeted_block(
+    camera_transform: &Transform,
+    player_transform: &Transform,
+    grid: &VoxelGrid,
+) -> Option<(i32, i32, i32)> {
+    let origin_offset = Vec3::new(-CHUNK_RADIUS as f32, 0.0, -CHUNK_RADIUS as f32);
+    let ray_origin = (player_transform.translation + Vec3::Y * 0.5) - origin_offset;
+    let ray_dir = camera_transform.forward().as_vec3();
+    let mine_range = 6.0;
+
+    raycast_voxel(grid, ray_origin, ray_dir, mine_range)
+}
+
+// Draws a thin wireframe cube around whatever block the player is currently
+// aiming at, Minecraft-style. Runs every frame via Gizmos (immediate-mode
+// lines, nothing spawned/despawned), so it's cheap and independent of the
+// mining rebuild cost.
+fn highlight_targeted_block(
+    camera_query: Query<&Transform, With<Camera3d>>,
+    player_query: Query<&Transform, (With<Player>, Without<Camera3d>)>,
+    voxel_world: Res<VoxelWorld>,
+    mut gizmos: Gizmos,
+) {
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+
+    let Some((gx, gy, gz)) =
+        find_targeted_block(camera_transform, player_transform, &voxel_world.grid)
+    else {
+        return;
+    };
+
+    let origin_offset = Vec3::new(-CHUNK_RADIUS as f32, 0.0, -CHUNK_RADIUS as f32);
+    let block_center = origin_offset + Vec3::new(gx as f32 + 0.5, gy as f32 + 0.5, gz as f32 + 0.5);
+
+    // Slightly larger than the 1x1x1 block so the outline doesn't z-fight
+    // with the block's own faces — same trick Minecraft's overlay uses.
+    gizmos.cube(
+        Transform::from_translation(block_center).with_scale(Vec3::splat(1.02)),
+        Color::BLACK,
+    );
+}
+
+fn mine_block(
+    mouse_button: Res<ButtonInput<MouseButton>>,
+    camera_query: Query<&Transform, With<Camera3d>>,
+    player_query: Query<&Transform, (With<Player>, Without<Camera3d>)>,
+    mut voxel_world: ResMut<VoxelWorld>,
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    if !mouse_button.just_pressed(MouseButton::Right) {
+        return;
+    }
+
+    let Ok(camera_transform) = camera_query.single() else {
+        return;
+    };
+    let Ok(player_transform) = player_query.single() else {
+        return;
+    };
+
+    if let Some((gx, gy, gz)) =
+        find_targeted_block(camera_transform, player_transform, &voxel_world.grid)
+    {
+        voxel_world.grid.set(gx, gy, gz, Block::Air);
+        rebuild_voxel_meshes(&mut commands, &mut meshes, &mut materials, &mut voxel_world);
+    }
 }
 
 // ---------- Setup ----------
@@ -435,6 +614,28 @@ fn check_skybox_loaded(
     }
 }
 
+// Esc releases the cursor (shows it, stops locking it to the window) so you
+// can get to a menu, alt-tab, etc. Clicking back in the window re-grabs and
+// re-hides it. The cursor starts grabbed already via primary_cursor_options
+// in main(), so this only needs to handle the release/re-grab toggle.
+fn grab_mouse_cursor(
+    mut cursor_options: Single<&mut CursorOptions>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse_button: Res<ButtonInput<MouseButton>>,
+) {
+    if keyboard.just_pressed(KeyCode::Escape) {
+        cursor_options.visible = true;
+        cursor_options.grab_mode = CursorGrabMode::None;
+    }
+
+    if mouse_button.just_pressed(MouseButton::Left)
+        && cursor_options.grab_mode == CursorGrabMode::None
+    {
+        cursor_options.visible = false;
+        cursor_options.grab_mode = CursorGrabMode::Locked;
+    }
+}
+
 fn move_player(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut player_query: Query<(&mut Transform, &mut Velocity), With<Player>>,
@@ -483,7 +684,6 @@ fn move_player(
 }
 
 fn camera_orbit(
-    mouse_button: Res<ButtonInput<MouseButton>>,
     mut mouse_motion_events: MessageReader<MouseMotion>,
     player_query: Query<&Transform, (With<Player>, Without<CameraRig>)>,
     mut camera_query: Query<(&mut Transform, &mut CameraRig), Without<Player>>,
@@ -498,7 +698,10 @@ fn camera_orbit(
     }
 
     for (mut cam_transform, mut rig) in &mut camera_query {
-        if mouse_button.pressed(MouseButton::Left) && delta != Vec2::ZERO {
+        // Cursor is locked to the window (see grab_mouse_cursor), so just
+        // follow raw mouse movement every frame — no need to hold a button
+        // down first, same as most 3rd-person open-world cameras.
+        if delta != Vec2::ZERO {
             let sensitivity = 0.005;
             rig.yaw += delta.x * sensitivity;
             rig.pitch = (rig.pitch + delta.y * sensitivity).clamp(-1.5, 1.5);
